@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF Blur</title>
+<style>
+:root{
+  --bg:#eef0f2; --panel:#ffffff; --ink:#1b2430; --muted:#5d6978; --line:#d5dae0;
+  --accent:#0f5c66; --accent-ink:#ffffff; --danger:#b3261e;
+}
+@media (prefers-color-scheme: dark){
+  :root{ --bg:#14181d; --panel:#1d232b; --ink:#e8ecf0; --muted:#98a3b0; --line:#2f3844; --accent:#4cb4c2; --accent-ink:#0c1a1d; --danger:#ff8a80; }
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font-family:"Segoe UI",system-ui,-apple-system,Roboto,sans-serif}
+header{position:sticky;top:0;z-index:20;background:var(--panel);border-bottom:1px solid var(--line);padding:10px 16px;display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+h1{font-size:18px;margin:0 12px 0 0;font-weight:700;letter-spacing:.2px}
+button,label.btn{font:inherit;font-size:14px;padding:8px 14px;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--ink);cursor:pointer}
+button:hover,label.btn:hover{border-color:var(--accent)}
+button:focus-visible,label.btn:focus-within{outline:2px solid var(--accent);outline-offset:2px}
+button.primary,label.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
+button:disabled{opacity:.45;cursor:not-allowed}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg button{border:0;border-radius:0}
+.seg button.on{background:var(--accent);color:var(--accent-ink)}
+#status{margin-left:auto;font-size:13px;color:var(--muted)}
+input[type=file]{display:none}
+main{padding:18px 12px 60px;display:flex;flex-direction:column;align-items:center;gap:18px}
+#empty{max-width:480px;text-align:center;margin-top:12vh;color:var(--muted);line-height:1.6;border:2px dashed var(--line);border-radius:14px;padding:36px 24px}
+#empty strong{color:var(--ink);display:block;font-size:17px;margin-bottom:6px}
+.page{position:relative;box-shadow:0 2px 14px rgba(0,0,0,.18);background:#fff;max-width:100%}
+.page canvas{display:block;max-width:100%;height:auto}
+.ov{position:absolute;inset:0;cursor:crosshair;touch-action:none}
+.box{position:absolute;border:1.5px solid var(--danger)}
+.box.black{background:#000}
+.box.blur{background:rgba(120,120,120,.35);backdrop-filter:blur(7px);-webkit-backdrop-filter:blur(7px)}
+.box button{position:absolute;top:-11px;right:-11px;width:22px;height:22px;padding:0;border-radius:50%;line-height:1;font-size:14px;background:var(--danger);color:#fff;border:0;display:none}
+.box:hover button,.box:focus-within button{display:block}
+.pnum{position:absolute;left:8px;bottom:6px;font-size:11px;background:rgba(0,0,0,.55);color:#fff;padding:1px 7px;border-radius:10px;pointer-events:none}
+.note{font-size:12.5px;color:var(--muted);max-width:620px;text-align:center}
+</style>
+</head>
+<body>
+<header>
+  <h1>PDF Blur</h1>
+  <label class="btn primary" tabindex="0">Open PDF<input type="file" id="file" accept="application/pdf"></label>
+  <div class="seg" role="group" aria-label="Cover style">
+    <button id="mBlack" class="on">Black bar</button>
+    <button id="mBlur">Blur</button>
+  </div>
+  <button id="undo" disabled>Undo</button>
+  <button id="clear" disabled>Clear all</button>
+  <button id="save" class="primary" disabled>Download redacted PDF</button>
+  <span id="status">No file loaded</span>
+</header>
+
+<main id="pages">
+  <div id="empty">
+    <strong>Open a PDF, then drag over anything private.</strong>
+    Names, ID numbers, addresses, signatures. The file stays on your device; nothing is uploaded.
+  </div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+const $ = id => document.getElementById(id);
+const host = $("pages"), statusEl = $("status");
+let pdf = null, pages = [], history = [], mode = "black", fileName = "document";
+const VIEW_SCALE = 1.5, EXPORT_SCALE = 2.5;
+
+function setStatus(t){ statusEl.textContent = t; }
+function refreshButtons(){
+  const any = pages.some(p => p.boxes.length);
+  $("undo").disabled = !history.length;
+  $("clear").disabled = !any;
+  $("save").disabled = !pdf;
+}
+
+$("mBlack").onclick = () => setMode("black");
+$("mBlur").onclick = () => setMode("blur");
+function setMode(m){
+  mode = m;
+  $("mBlack").classList.toggle("on", m === "black");
+  $("mBlur").classList.toggle("on", m === "blur");
+}
+
+$("file").addEventListener("change", async e => {
+  const f = e.target.files[0];
+  if(!f) return;
+  fileName = f.name.replace(/\.pdf$/i, "");
+  setStatus("Loading…");
+  try{
+    const data = new Uint8Array(await f.arrayBuffer());
+    pdf = await pdfjsLib.getDocument({data}).promise;
+    await renderAll();
+    setStatus(pdf.numPages + " page" + (pdf.numPages>1?"s":"") + " · drag to cover");
+  }catch(err){
+    console.error(err);
+    pdf = null;
+    setStatus("Could not open this PDF (it may be password-protected).");
+  }
+  e.target.value = "";
+  refreshButtons();
+});
+
+async function renderAll(){
+  host.innerHTML = "";
+  pages = []; history = [];
+  const tip = document.createElement("div");
+  tip.className = "note";
+  tip.textContent = "Drag on a page to cover text. Hover a box and press × to remove it.";
+  host.appendChild(tip);
+  for(let i=1;i<=pdf.numPages;i++){
+    const page = await pdf.getPage(i);
+    const vp = page.getViewport({scale: VIEW_SCALE});
+    const wrap = document.createElement("div");
+    wrap.className = "page";
+    wrap.style.width = vp.width + "px";
+    const canvas = document.createElement("canvas");
+    canvas.width = vp.width; canvas.height = vp.height;
+    wrap.appendChild(canvas);
+    const ov = document.createElement("div");
+    ov.className = "ov";
+    wrap.appendChild(ov);
+    const num = document.createElement("div");
+    num.className = "pnum"; num.textContent = i + " / " + pdf.numPages;
+    wrap.appendChild(num);
+    host.appendChild(wrap);
+    await page.render({canvasContext: canvas.getContext("2d"), viewport: vp}).promise;
+    const rec = {boxes: [], ov, wrap, index: i};
+    pages.push(rec);
+    attachDrawing(rec);
+    setStatus("Rendering " + i + " / " + pdf.numPages);
+  }
+}
+
+function attachDrawing(rec){
+  const ov = rec.ov;
+  let start = null, tmp = null;
+  ov.addEventListener("pointerdown", e => {
+    if(e.target !== ov) return;
+    const r = ov.getBoundingClientRect();
+    start = {x: e.clientX - r.left, y: e.clientY - r.top, r};
+    tmp = document.createElement("div");
+    tmp.className = "box " + mode;
+    ov.appendChild(tmp);
+    ov.setPointerCapture(e.pointerId);
+  });
+  ov.addEventListener("pointermove", e => {
+    if(!start) return;
+    const {r} = start;
+    const x = Math.max(0, Math.min(r.width, e.clientX - r.left));
+    const y = Math.max(0, Math.min(r.height, e.clientY - r.top));
+    Object.assign(tmp.style, {
+      left: Math.min(start.x, x)+"px", top: Math.min(start.y, y)+"px",
+      width: Math.abs(x-start.x)+"px", height: Math.abs(y-start.y)+"px"
+    });
+  });
+  ov.addEventListener("pointerup", e => {
+    if(!start) return;
+    const {r} = start;
+    const x = Math.max(0, Math.min(r.width, e.clientX - r.left));
+    const y = Math.max(0, Math.min(r.height, e.clientY - r.top));
+    const w = Math.abs(x-start.x), h = Math.abs(y-start.y);
+    const el = tmp; tmp = null;
+    const sx = start.x; const sy = start.y; start = null;
+    if(w < 6 || h < 6){ el.remove(); return; }
+    const box = {fx: Math.min(sx,x)/r.width, fy: Math.min(sy,y)/r.height, fw: w/r.width, fh: h/r.height, mode: el.classList.contains("blur") ? "blur" : "black", el};
+    const del = document.createElement("button");
+    del.textContent = "×"; del.title = "Remove"; del.setAttribute("aria-label","Remove box");
+    del.addEventListener("pointerdown", ev => ev.stopPropagation());
+    del.addEventListener("click", () => removeBox(rec, box));
+    el.appendChild(del);
+    rec.boxes.push(box);
+    history.push({rec, box});
+    refreshButtons();
+  });
+}
+
+function removeBox(rec, box){
+  box.el.remove();
+  rec.boxes = rec.boxes.filter(b => b !== box);
+  history = history.filter(h => h.box !== box);
+  refreshButtons();
+}
+
+$("undo").onclick = () => {
+  const last = history[history.length-1];
+  if(last) removeBox(last.rec, last.box);
+};
+$("clear").onclick = () => {
+  pages.forEach(p => { p.boxes.forEach(b => b.el.remove()); p.boxes = []; });
+  history = [];
+  refreshButtons();
+};
+
+function applyBox(ctx, cw, ch, b){
+  const x = Math.floor(b.fx*cw), y = Math.floor(b.fy*ch);
+  const w = Math.ceil(b.fw*cw), h = Math.ceil(b.fh*ch);
+  if(b.mode === "black"){
+    ctx.fillStyle = "#000";
+    ctx.fillRect(x, y, w, h);
+  }else{
+    // Strong pixelation so text cannot be recovered
+    const block = Math.max(14, Math.round(Math.min(w,h)/2));
+    const sw = Math.max(1, Math.round(w/block)), sh = Math.max(1, Math.round(h/block));
+    const s = document.createElement("canvas");
+    s.width = sw; s.height = sh;
+    const sctx = s.getContext("2d");
+    sctx.drawImage(ctx.canvas, x, y, w, h, 0, 0, sw, sh);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(s, 0, 0, sw, sh, x, y, w, h);
+    ctx.imageSmoothingEnabled = true;
+    ctx.fillStyle = "rgba(128,128,128,.25)";
+    ctx.fillRect(x, y, w, h);
+  }
+}
+
+$("save").onclick = async () => {
+  if(!pdf) return;
+  $("save").disabled = true;
+  try{
+    const {jsPDF} = window.jspdf;
+    let doc = null;
+    for(let i=1;i<=pdf.numPages;i++){
+      setStatus("Exporting page " + i + " / " + pdf.numPages + "…");
+      const page = await pdf.getPage(i);
+      const base = page.getViewport({scale: 1});
+      const vp = page.getViewport({scale: EXPORT_SCALE});
+      const c = document.createElement("canvas");
+      c.width = Math.round(vp.width); c.height = Math.round(vp.height);
+      const ctx = c.getContext("2d");
+      ctx.fillStyle = "#fff"; ctx.fillRect(0,0,c.width,c.height);
+      await page.render({canvasContext: ctx, viewport: vp}).promise;
+      pages[i-1].boxes.forEach(b => applyBox(ctx, c.width, c.height, b));
+      const img = c.toDataURL("image/jpeg", 0.92);
+      const orient = base.width > base.height ? "l" : "p";
+      if(!doc) doc = new jsPDF({unit:"pt", format:[base.width, base.height], orientation: orient, compress:true});
+      else doc.addPage([base.width, base.height], orient);
+      doc.addImage(img, "JPEG", 0, 0, base.width, base.height);
+    }
+    doc.save(fileName + "-redacted.pdf");
+    setStatus("Saved " + fileName + "-redacted.pdf");
+  }catch(err){
+    console.error(err);
+    setStatus("Export failed. Try a smaller PDF.");
+  }
+  refreshButtons();
+};
+</script>
+</body>
+</html>
